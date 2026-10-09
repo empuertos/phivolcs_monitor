@@ -30,7 +30,7 @@ ACCESS_KEY = os.getenv("ACCESS_KEY", "CHANGE-ME-TO-YOUR-SECRET-KEY")
 
 # ---------- ALLOWED WEBSITES (CORS) ----------
 ALLOWED_ORIGINS = [
-    "https://your-vercel-site.vercel.app",  # ← PALITAN MO ITO NG WEBSITE MO
+    "https://steveweb.vercel.app",  # ← PALITAN MO ITO NG WEBSITE MO
     "http://localhost:3000",
     "http://127.0.0.1:5500"
 ]
