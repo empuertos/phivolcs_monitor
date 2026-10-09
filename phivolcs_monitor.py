@@ -1,10 +1,10 @@
 import requests
 from bs4 import BeautifulSoup
 import time
-import csv
+import json
 import os
 from datetime import datetime
-from flask import Flask
+from flask import Flask, send_file, request
 
 # ============= CONFIGURATION =============
 SITES = {
@@ -16,38 +16,47 @@ HEADERS = {
     "User-Agent": "PH-Earthquake-Monitor/1.0 (your-email@example.com)"
 }
 
-# Philippines boundaries
 PH_LAT_MIN, PH_LAT_MAX = 4.0, 22.0
 PH_LON_MIN, PH_LON_MAX = 116.0, 127.0
 MIN_MAG = 4.0
-DELAY_BETWEEN_SITES = 5   # seconds
-CHECK_INTERVAL = 300      # check every 5 minutes (300 seconds)
+DELAY_BETWEEN_SITES = 5
+CHECK_INTERVAL = 300
 
-# ---------- TELEGRAM SETTINGS — from Environment Variables ----------
+# ---------- SECURITY & TELEGRAM ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SEND_TELEGRAM_ALERTS = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+ACCESS_KEY = os.getenv("ACCESS_KEY", "CHANGE-ME-TO-YOUR-SECRET-KEY")
+
+# ---------- ALLOWED WEBSITES (CORS) ----------
+ALLOWED_ORIGINS = [
+    "https://your-vercel-site.vercel.app",  # ← PALITAN MO ITO NG WEBSITE MO
+    "http://localhost:3000",
+    "http://127.0.0.1:5500"
+]
 # ========================================
 
-# Track sent alerts to avoid duplicates
 last_earthquakes = set()
 last_tsunami = set()
 
-# Flask app for UptimeRobot (keeps Render awake)
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "✅ PHIVOLCS Monitor is running!"
+# ─────────── SECURITY: CORS PROTECTION ───────────
+@app.after_request
+def cors_protect(response):
+    origin = request.headers.get("Origin", "")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    else:
+        response.headers["Access-Control-Allow-Origin"] = ""
+    return response
 
 # ─────────── TELEGRAM FUNCTIONS ───────────
-
 def send_telegram_message(message):
-    """Send message to Telegram chat"""
     if not SEND_TELEGRAM_ALERTS:
-        print("[Telegram] ⚠️ Missing credentials — message skipped")
         return False
-    
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {
@@ -57,19 +66,12 @@ def send_telegram_message(message):
             "disable_web_page_preview": True
         }
         resp = requests.post(url, data=data, timeout=15)
-        result = resp.json()
-        if result.get("ok"):
-            print("[Telegram] ✅ Message sent")
-            return True
-        else:
-            print(f"[Telegram] ❌ Error: {result.get('description', 'Unknown error')}")
-            return False
+        return resp.json().get("ok", False)
     except Exception as e:
-        print(f"[Telegram] ❌ Failed: {e}")
+        print(f"Telegram Error: {e}")
         return False
 
 def format_earthquake_alert(eq):
-    """Format earthquake alert message"""
     return f"""🌍 *EARTHQUAKE ALERT*
 📍 Location: {eq['location']}
 🕒 Time: {eq['datetime']}
@@ -79,19 +81,15 @@ def format_earthquake_alert(eq):
 Source: PHIVOLCS-DOST"""
 
 def format_tsunami_alert(ts):
-    """Format tsunami alert message"""
     return f"""🌊 *TSUNAMI ADVISORY*
 ⚠️ Tsunami threat detected!
 🕒 Time: {ts['datetime']}
 📍 Location: {ts['location']}
 📊 Magnitude: {ts['magnitude']}
-📢 Advisory: {ts.get('advisory', 'See PHIVOLCS for details')}
 Source: PHIVOLCS-DOST"""
 
 # ─────────── SCRAPER FUNCTIONS ───────────
-
 def is_in_philippines(lat, lon):
-    """Check if coordinates are within Philippine territory"""
     try:
         lat = float(lat)
         lon = float(lon)
@@ -100,26 +98,22 @@ def is_in_philippines(lat, lon):
         return False
 
 def scrape_earthquake_page():
-    """Scrape earthquake page — M4.0+ in Philippines only"""
-    print("\n" + "="*55)
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking Earthquake page...")
+    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking Earthquake page...")
     try:
         resp = requests.get(SITES["earthquake"], headers=HEADERS, timeout=30)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         rows = soup.find_all("tr")
-        
         filtered = []
+        
         for row in rows:
             cols = [td.get_text(strip=True) for td in row.find_all("td")]
-            if len(cols) < 6:
-                continue
+            if len(cols) < 6: continue
             try:
                 mag = float(cols[4])
                 lat = float(cols[1])
                 lon = float(cols[2])
-            except:
-                continue
+            except: continue
             
             if mag >= MIN_MAG and is_in_philippines(lat, lon):
                 eq_id = f"{cols[0]}|{mag}|{lat}|{lon}"
@@ -132,16 +126,13 @@ def scrape_earthquake_page():
                     "magnitude": mag,
                     "location": cols[5]
                 })
-        
         print(f"Found {len(filtered)} earthquake(s) ≥{MIN_MAG}.0 in the Philippines")
         return filtered
     except Exception as e:
-        print(f"❌ Error scraping earthquake page: {e}")
+        print(f"❌ Error: {e}")
         return []
 
 def scrape_tsunami_page():
-    """Scrape tsunami page — threats only, skip 'No Tsunami Threat'"""
-    print("\n" + "="*55)
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking Tsunami page...")
     try:
         resp = requests.get(SITES["tsunami"], headers=HEADERS, timeout=30)
@@ -153,16 +144,12 @@ def scrape_tsunami_page():
         
         soup = BeautifulSoup(resp.text, "html.parser")
         rows = soup.find_all("tr")
-        
         filtered = []
+        
         for row in rows:
             cols = [td.get_text(strip=True) for td in row.find_all("td")]
-            if len(cols) < 5:
-                continue
-            
-            advisory_text = " ".join(cols[5:]).upper() if len(cols) > 5 else ""
-            if "NO TSUNAMI THREAT" in advisory_text:
-                continue
+            if len(cols) < 5: continue
+            if "NO TSUNAMI THREAT" in " ".join(cols).upper(): continue
             
             ts_id = f"{cols[0]}|{cols[4]}|{cols[5]}"
             filtered.append({
@@ -172,130 +159,108 @@ def scrape_tsunami_page():
                 "longitude": cols[2],
                 "depth_km": cols[3],
                 "magnitude": cols[4],
-                "location": cols[5] if len(cols) > 5 else "",
-                "advisory": cols[6] if len(cols) > 6 else "Tsunami Advisory"
+                "location": cols[5] if len(cols)>5 else "",
+                "advisory": cols[6] if len(cols)>6 else "Tsunami Advisory"
             })
-        
         if filtered:
-            print(f"⚠️ Found {len(filtered)} tsunami advisory(ies) with threat")
-        else:
-            print("ℹ️ No active tsunami threat")
+            print(f"⚠️ Found {len(filtered)} tsunami advisory(ies)")
         return filtered
     except Exception as e:
-        print(f"❌ Error scraping tsunami page: {e}")
+        print(f"❌ Error: {e}")
         return []
 
-def save_to_csv(data, filename):
-    """Save data to CSV file"""
+# ─────────── SAVE TO JSON ───────────
+def save_json(data, filename):
     if not data:
-        return
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fn = f"{filename}_{ts}.csv"
-    try:
-        with open(fn, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=data[0].keys())
-            writer.writeheader()
-            writer.writerows(data)
-        print(f"💾 Saved: {fn}")
-    except Exception as e:
-        print(f"⚠️ Could not save CSV: {e}")
+        data = []
+    export_data = [{k: v for k, v in item.items() if k != "id"} for item in data]
+    with open(f"{filename}.json", "w", encoding="utf-8") as f:
+        json.dump(export_data, f, ensure_ascii=False, indent=2)
+    print(f"💾 Saved: {filename}.json ({len(export_data)} records)")
 
-def check_for_new_alerts():
-    """Check for new entries and send alerts"""
-    global last_earthquakes, last_tsunami
-    
-    # Check Earthquakes
-    eq_list = scrape_earthquake_page()
-    new_eq = 0
-    for eq in eq_list:
-        if eq["id"] not in last_earthquakes:
-            print(f"🆕 New Earthquake: M{eq['magnitude']} — {eq['location']}")
-            send_telegram_message(format_earthquake_alert(eq))
-            last_earthquakes.add(eq["id"])
-            new_eq += 1
-    
-    if new_eq == 0 and eq_list:
-        print("✅ No new earthquakes")
-    
-    time.sleep(DELAY_BETWEEN_SITES)
-    
-    # Check Tsunami
-    ts_list = scrape_tsunami_page()
-    new_ts = 0
-    for ts in ts_list:
-        if ts["id"] not in last_tsunami:
-            print(f"🆕 New Tsunami Advisory!")
-            send_telegram_message(format_tsunami_alert(ts))
-            last_tsunami.add(ts["id"])
-            new_ts += 1
-    
-    if new_ts == 0:
-        print("✅ No new tsunami advisories")
-    
-    # Save data
-    if eq_list:
-        save_to_csv(eq_list, "phivolcs_earthquakes")
-    if ts_list:
-        save_to_csv(ts_list, "phivolcs_tsunami")
-    
-    print(f"\n⏰ Next check in {CHECK_INTERVAL/60:.1f} minutes\n")
-    print("-" * 55)
+# ─────────── PROTECTED API ENDPOINTS ───────────
+def check_key():
+    return request.args.get("key", "") == ACCESS_KEY
 
+@app.route('/')
+def home():
+    return "✅ PHIVOLCS Monitor — Access Protected"
+
+@app.route('/earthquakes.json')
+def get_earthquakes_json():
+    if not check_key():
+        return "❌ Access Denied — Invalid Key", 403
+    return send_file('earthquakes.json', mimetype='application/json')
+
+@app.route('/tsunami.json')
+def get_tsunami_json():
+    if not check_key():
+        return "❌ Access Denied — Invalid Key", 403
+    return send_file('tsunami.json', mimetype='application/json')
+
+# ─────────── MAIN MONITOR ───────────
 def monitor_loop():
-    """Main monitoring loop"""
     global last_earthquakes, last_tsunami
     
-    print("\n" + "=" * 55)
-    print("  PHIVOLCS Earthquake & Tsunami Monitor")
-    print("  M4.0+ in Philippines | Tsunami Threats Only")
-    print("=" * 55)
+    print("\n" + "="*55)
+    print("  🔒 PHIVOLCS MONITOR — PROTECTED VERSION")
+    print("  M4.0+ PH Only | Tsunami Threats Only | Telegram Alerts")
+    print("="*55)
     
-    # Telegram status
     if SEND_TELEGRAM_ALERTS:
         print("📱 Telegram Alerts: ENABLED")
     else:
-        print("⚠️ Telegram Alerts: DISABLED — check env vars")
+        print("⚠️ Telegram Alerts: DISABLED")
     
-    # Initial load — don't alert on existing data
-    print("\n📥 Performing initial check...")
+    print("\n📥 Initial check...")
     initial_eq = scrape_earthquake_page()
     for eq in initial_eq:
         last_earthquakes.add(eq["id"])
-    print(f"✅ Loaded {len(last_earthquakes)} past earthquake records")
+    save_json(initial_eq, "earthquakes")
     
     time.sleep(DELAY_BETWEEN_SITES)
     
     initial_ts = scrape_tsunami_page()
     for ts in initial_ts:
         last_tsunami.add(ts["id"])
-    print(f"✅ Loaded {len(last_tsunami)} past tsunami records")
+    save_json(initial_ts, "tsunami")
     
-    print("\n🚀 Monitoring started! Waiting for new events...\n")
+    print("\n🚀 Monitoring started! Access key enabled.\n")
     
-    # Main loop
     while True:
         try:
-            check_for_new_alerts()
+            eq_list = scrape_earthquake_page()
+            for eq in eq_list:
+                if eq["id"] not in last_earthquakes:
+                    print(f"🆕 NEW EARTHQUAKE: M{eq['magnitude']} — {eq['location']}")
+                    send_telegram_message(format_earthquake_alert(eq))
+                    last_earthquakes.add(eq["id"])
+            save_json(eq_list, "earthquakes")
+            
+            time.sleep(DELAY_BETWEEN_SITES)
+            
+            ts_list = scrape_tsunami_page()
+            for ts in ts_list:
+                if ts["id"] not in last_tsunami:
+                    print(f"🆕 NEW TSUNAMI ADVISORY!")
+                    send_telegram_message(format_tsunami_alert(ts))
+                    last_tsunami.add(ts["id"])
+            save_json(ts_list, "tsunami")
+            
+            print(f"⏰ Next check in {CHECK_INTERVAL/60:.1f} min\n")
             time.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
-            print("\n\n⏹️ Stopped by user")
+            print("\n⏹️ Stopped")
             break
         except Exception as e:
-            print(f"\n⚠️ Loop error: {e}")
-            print(f"Retrying in {CHECK_INTERVAL/60:.1f} minutes...\n")
-            time.sleep(CHECK_INTERVAL)
+            print(f"⚠️ Error: {e} — retrying in 60s\n")
+            time.sleep(60)
 
 # ─────────── RUN ───────────
-
 if __name__ == "__main__":
-    # Start Flask server for UptimeRobot in background
     from threading import Thread
     def run_flask():
         app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
-    
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print("🌐 Web server started — ready for UptimeRobot")
-    
-    # Start monitoring
+    Thread(target=run_flask, daemon=True).start()
+    print("🌐 API Running — Access key & CORS protection enabled\n")
     monitor_loop()
