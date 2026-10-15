@@ -20,7 +20,7 @@ HEADERS = {
 PH_LAT_MIN, PH_LAT_MAX = 4.0, 22.0
 PH_LON_MIN, PH_LON_MAX = 116.0, 127.0
 MIN_MAG = 4.0
-CHECK_INTERVAL = 60  # ⏱️ UPDATED: 60 seconds = 1 minute
+CHECK_INTERVAL = 60  # 1 minute
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -28,18 +28,52 @@ SEND_TELEGRAM_ALERTS = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 ACCESS_KEY = os.getenv("ACCESS_KEY", "CHANGE-ME-TO-YOUR-SECRET-KEY")
 
 ALLOWED_ORIGINS = [
-    "https://your-vercel-site.vercel.app",
+    "https://steveweb.vercel.app",
     "http://localhost:3000",
     "http://127.0.0.1:5500"
 ]
 # ========================================
 
-last_earthquakes = set()
-last_tsunami = set()
+SENT_EQ_FILE = "sent_earthquakes.json"
+SENT_TS_FILE = "sent_tsunami.json"
 
 app = Flask(__name__)
 
-# ─────────── SECURITY ───────────
+# ─────────── LOAD/SAVE SENT IDs ───────────
+def load_sent_ids(filename):
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except:
+            return set()
+    return set()
+
+def save_sent_ids(filename, data_set):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(list(data_set), f)
+
+last_earthquakes = load_sent_ids(SENT_EQ_FILE)
+last_tsunami = load_sent_ids(SENT_TS_FILE)
+
+# ─────────── GET TODAY'S DATE ───────────
+def is_today(date_str):
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today in date_str or date_str.startswith(today.replace("-", "/")):
+            return True
+        # Try parse
+        for fmt in ["%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"]:
+            try:
+                dt = datetime.strptime(date_str.strip(), fmt)
+                return dt.date() == datetime.now().date()
+            except:
+                continue
+        return False
+    except:
+        return True  # Kung hindi mabasa ang date, isama na lang
+
+# ─────────── CORS ───────────
 @app.after_request
 def cors_protect(response):
     origin = request.headers.get("Origin", "")
@@ -68,7 +102,7 @@ def send_telegram_message(message):
         return False
 
 def format_earthquake_alert(eq):
-    return f"""🌍 *EARTHQUAKE ALERT*
+    return f"""🌍 *NEW EARTHQUAKE ALERT*
 📍 Location: {eq['location']}
 🕒 Time: {eq['datetime']}
 📊 Magnitude: {eq['magnitude']}
@@ -77,7 +111,7 @@ def format_earthquake_alert(eq):
 Source: PHIVOLCS-DOST"""
 
 def format_tsunami_alert(ts):
-    return f"""🌊 *TSUNAMI ADVISORY*
+    return f"""🌊 *NEW TSUNAMI ADVISORY*
 ⚠️ Tsunami threat detected!
 🕒 Time: {ts['datetime']}
 📍 Location: {ts.get('location', 'Philippines')}
@@ -93,7 +127,8 @@ def is_in_philippines(lat, lon):
 
 def scrape_earthquakes():
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"\n[{now}] 🔄 Checking Earthquake page...")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    print(f"\n[{now}] 🔄 Checking Earthquake page... (Showing TODAY: {today_str} only)")
     try:
         resp = requests.get(SITES["earthquake"], headers=HEADERS, timeout=30)
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -118,7 +153,10 @@ def scrape_earthquakes():
                     "location": cols[5],
                     "last_updated": now
                 })
-        print(f"✅ Found {len(results)} earthquake(s) ≥{MIN_MAG}.0")
+        
+        # ✅ SORT: Pinakabago sa taas
+        results.reverse()
+        print(f"✅ Found {len(results)} total earthquake(s) ≥{MIN_MAG}.0")
         return results
     except Exception as e:
         print(f"❌ Earthquake Scrape Error: {e}")
@@ -152,6 +190,7 @@ def scrape_tsunami():
                 "last_updated": now
             })
         if results:
+            results.reverse()  # Pinakabago sa taas
             print(f"⚠️ Found {len(results)} tsunami advisory(ies)")
         return results
     except Exception as e:
@@ -173,7 +212,9 @@ def home():
     return {
         "status": "online",
         "last_updated": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "refresh_interval": f"{CHECK_INTERVAL} seconds"
+        "refresh_interval": f"{CHECK_INTERVAL} seconds",
+        "allowed_website": "https://steveweb.vercel.app",
+        "note": "Shows latest 10 only — newest first"
     }
 
 @app.route('/earthquakes.json')
@@ -188,40 +229,59 @@ def get_ts():
 def monitor():
     global last_earthquakes, last_tsunami
     print("\n" + "="*60)
-    print("  🇵🇭 PHIVOLCS MONITOR — UPDATED 2026-10-15")
-    print(f"  ⏱️ Refresh: Every {CHECK_INTERVAL} sec | M{MIN_MAG}.0+ PH Only | Tsunami Only")
+    print("  🇵🇭 PHIVOLCS MONITOR — UPDATED: NO DUPLICATE ALERTS")
+    print(f"  ⏱️ Refresh: Every {CHECK_INTERVAL}sec | M{MIN_MAG}.0+ PH Only")
+    print("  ✅ Sorted: Newest First | ✅ Persistent: Remembers sent alerts")
     print("="*60 + "\n")
     print(f"📱 Telegram: {'✅ ENABLED' if SEND_TELEGRAM_ALERTS else '❌ DISABLED'}")
+    print(f"🔒 Allowed Website: https://steveweb.vercel.app")
+    print(f"💾 Loaded {len(last_earthquakes)} sent earthquake IDs (won't re-send)\n")
 
-    # Initial run
+    # Initial run — mark existing items as already sent
     eq_list = scrape_earthquakes()
-    for eq in eq_list: last_earthquakes.add(eq["id"])
+    for eq in eq_list:
+        if eq["id"] not in last_earthquakes:
+            last_earthquakes.add(eq["id"])
+    save_sent_ids(SENT_EQ_FILE, last_earthquakes)
     save_json(eq_list, "earthquakes")
+    print(f"✅ Marked {len(eq_list)} existing earthquakes as 'already sent' — won't alert again")
 
     ts_list = scrape_tsunami()
-    for ts in ts_list: last_tsunami.add(ts["id"])
+    for ts in ts_list:
+        if ts["id"] not in last_tsunami:
+            last_tsunami.add(ts["id"])
+    save_sent_ids(SENT_TS_FILE, last_tsunami)
     save_json(ts_list, "tsunami")
+    print(f"✅ Marked {len(ts_list)} existing tsunami as 'already sent'")
 
-    print("\n🚀 Monitoring active — checking every 60 seconds...\n")
+    print("\n🚀 Monitoring active — ONLY NEW events will trigger alerts\n")
 
     while True:
         try:
             # Earthquakes
             eq_list = scrape_earthquakes()
+            new_count = 0
             for eq in eq_list:
                 if eq["id"] not in last_earthquakes:
-                    print(f"🆕 NEW: M{eq['magnitude']} — {eq['location']}")
+                    print(f"🆕 NEW EARTHQUAKE ALERT: M{eq['magnitude']} — {eq['location']} at {eq['datetime']}")
                     send_telegram_message(format_earthquake_alert(eq))
                     last_earthquakes.add(eq["id"])
+                    new_count += 1
+            if new_count > 0:
+                save_sent_ids(SENT_EQ_FILE, last_earthquakes)
             save_json(eq_list, "earthquakes")
 
             # Tsunami
             ts_list = scrape_tsunami()
+            new_ts_count = 0
             for ts in ts_list:
                 if ts["id"] not in last_tsunami:
-                    print(f"🆕 NEW TSUNAMI ADVISORY!")
+                    print(f"🆕 NEW TSUNAMI ALERT: M{ts['magnitude']} — {ts['datetime']}")
                     send_telegram_message(format_tsunami_alert(ts))
                     last_tsunami.add(ts["id"])
+                    new_ts_count += 1
+            if new_ts_count > 0:
+                save_sent_ids(SENT_TS_FILE, last_tsunami)
             save_json(ts_list, "tsunami")
 
             time.sleep(CHECK_INTERVAL)
