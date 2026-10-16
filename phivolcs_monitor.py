@@ -42,15 +42,12 @@ app = Flask(__name__)
 
 # ─────────── PHILIPPINES TIME ───────────
 def ph_now():
-    """Get current time in Philippines (UTC+8)"""
     return datetime.utcnow() + timedelta(hours=PH_TZ_OFFSET)
 
 def ph_today_str():
-    """Today's date string in PH Time: YYYY-MM-DD"""
     return ph_now().strftime("%Y-%m-%d")
 
 def parse_phivolcs_date(date_str):
-    """Try parse PHIVOLCS date format, return datetime or None"""
     date_str = date_str.strip()
     formats = [
         "%Y-%m-%d %H:%M:%S",
@@ -66,13 +63,11 @@ def parse_phivolcs_date(date_str):
     return None
 
 def is_within_24_hours(date_str):
-    """Check if event is within the LAST 24 HOURS from Philippine Time"""
     now = ph_now()
     twenty_four_hours_ago = now - timedelta(hours=24)
     
     dt = parse_phivolcs_date(date_str)
     if not dt:
-        # Fallback: check today AND yesterday
         today = ph_today_str()
         yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         if today in date_str or today.replace("-","/") in date_str:
@@ -189,10 +184,10 @@ def scrape_earthquakes():
                     })
                 else:
                     old_count += 1
-                    print(f"🗑️ Skipped OLD: {cols[0]} | M{mag} | {cols[5]}")
+                    print(f"🗑️ SKIPPED (too old): {cols[0]} | M{mag} — NOT sent to Telegram")
         
         results.reverse()
-        print(f"✅ Result: {recent_count} events (last 24hrs) kept | {old_count} older removed")
+        print(f"✅ Result: {recent_count} events (last 24hrs) | {old_count} older skipped")
         return results
     except Exception as e:
         print(f"❌ Earthquake Scrape Error: {e}")
@@ -261,10 +256,10 @@ def home():
     return {
         "status": "online",
         "ph_time": ph_now().strftime('%Y-%m-%d %H:%M:%S'),
-        "filter": "Last 24 hours",
+        "filter": "Last 24 hours only — no old alerts",
         "refresh_interval": f"{CHECK_INTERVAL} seconds",
         "allowed_website": "https://steveweb.vercel.app",
-        "note": "Shows events from the most recent 24 hours — always up to date"
+        "note": "Old earthquakes (>24hrs) are NEVER sent to Telegram — only NEW events trigger alerts"
     }
 
 @app.route('/earthquakes.json')
@@ -279,57 +274,65 @@ def get_ts():
 def monitor():
     global last_earthquakes, last_tsunami
     print("\n" + "="*65)
-    print("  🇵🇭 PHIVOLCS MONITOR — 24-HOUR MODE")
+    print("  🇵🇭 PHIVOLCS MONITOR — FINAL VERSION")
     print(f"  🕒 PH Time: {ph_now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  ⏱️ Refresh: Every {CHECK_INTERVAL}sec | M{MIN_MAG}.0+ | Last 24 Hours")
-    print("  ✅ Remembers sent alerts — NEVER re-send the same alert twice")
-    print("  ✅ Auto updates daily — always shows latest 24 hours")
+    print("  ✅ Old events NEVER sent — only NEW events trigger alerts")
+    print("  ✅ Sent IDs saved — duplicates blocked even after restart")
     print("="*65 + "\n")
     print(f"📱 Telegram: {'✅ ENABLED' if SEND_TELEGRAM_ALERTS else '❌ DISABLED'}")
     print(f"🔒 Allowed Website: https://steveweb.vercel.app")
     print(f"💾 Loaded {len(last_earthquakes)} sent IDs — will NOT re-alert\n")
 
-    print("🔵 Initial load — marking existing events as already sent...")
+    # MARK EXISTING EVENTS AS SENT — NO ALERTS ON STARTUP
+    print("🔵 STEP 1: Marking ALL existing events as ALREADY SENT — NO ALERTS ON STARTUP")
     eq_list = scrape_earthquakes()
     for eq in eq_list:
         last_earthquakes.add(eq["id"])
     save_sent_ids(SENT_EQ_FILE, last_earthquakes)
     save_json(eq_list, "earthquakes")
-    print(f"✅ {len(eq_list)} existing earthquakes marked — will NOT send alerts for these")
+    print(f"✅ {len(eq_list)} existing earthquakes — MARKED AS SENT • NO TELEGRAM ALERT")
 
     ts_list = scrape_tsunami()
     for ts in ts_list:
         last_tsunami.add(ts["id"])
     save_sent_ids(SENT_TS_FILE, last_tsunami)
     save_json(ts_list, "tsunami")
-    print(f"✅ {len(ts_list)} existing tsunami marked — will NOT send alerts for these")
+    print(f"✅ {len(ts_list)} existing tsunami — MARKED AS SENT • NO TELEGRAM ALERT")
 
-    print("\n🚀 Monitoring ACTIVE — ONLY NEW events will trigger alerts!\n")
+    print("\n🚀 MONITORING STARTED — ONLY NEW EVENTS FROM NOW ON WILL SEND ALERTS!\n")
 
     while True:
         try:
+            # EARTHQUAKES — NEW + WITHIN 24H = ALERT
             eq_list = scrape_earthquakes()
             new_eq_count = 0
             for eq in eq_list:
                 if eq["id"] not in last_earthquakes:
-                    print(f"🆕 NEW EARTHQUAKE: M{eq['magnitude']} — {eq['location']} at {eq['datetime']}")
-                    send_telegram_message(format_earthquake_alert(eq))
-                    new_eq_count += 1
+                    if eq.get("is_within_24h", False):
+                        print(f"🆕 NEW ALERT SENT: M{eq['magnitude']} — {eq['location']} at {eq['datetime']}")
+                        send_telegram_message(format_earthquake_alert(eq))
+                        new_eq_count += 1
+                    else:
+                        print(f"⏳ TOO OLD — NOT SENT: {eq['datetime']} | M{eq['magnitude']}")
                     last_earthquakes.add(eq["id"])
             if new_eq_count > 0:
                 save_sent_ids(SENT_EQ_FILE, last_earthquakes)
+                print(f"✅ {new_eq_count} NEW earthquake alert(s) sent")
             save_json(eq_list, "earthquakes")
 
+            # TSUNAMI
             ts_list = scrape_tsunami()
             new_ts_count = 0
             for ts in ts_list:
                 if ts["id"] not in last_tsunami:
-                    print(f"🆕 NEW TSUNAMI ADVISORY: M{ts['magnitude']} — {ts['datetime']}")
+                    print(f"🆕 NEW TSUNAMI ALERT SENT: M{ts['magnitude']} — {ts['datetime']}")
                     send_telegram_message(format_tsunami_alert(ts))
                     last_tsunami.add(ts["id"])
                     new_ts_count += 1
             if new_ts_count > 0:
                 save_sent_ids(SENT_TS_FILE, last_tsunami)
+                print(f"✅ {new_ts_count} NEW tsunami alert(s) sent")
             save_json(ts_list, "tsunami")
 
             time.sleep(CHECK_INTERVAL)
