@@ -36,7 +36,7 @@ ALLOWED_ORIGINS = [
 
 SENT_EQ_FILE = "sent_earthquakes.json"
 SENT_TS_FILE = "sent_tsunami.json"
-PH_TZ_OFFSET = 8  # Philippines is UTC+8
+PH_TZ_OFFSET = 8
 
 app = Flask(__name__)
 
@@ -65,15 +65,24 @@ def parse_phivolcs_date(date_str):
             continue
     return None
 
-def is_today_in_ph(date_str):
-    """Check if event happened TODAY in PH Time"""
-    today = ph_today_str()
+def is_within_24_hours(date_str):
+    """Check if event is within the LAST 24 HOURS from Philippine Time"""
+    now = ph_now()
+    twenty_four_hours_ago = now - timedelta(hours=24)
+    
     dt = parse_phivolcs_date(date_str)
-    if dt:
-        event_date = dt.strftime("%Y-%m-%d")
-        return event_date == today
-    # Fallback: simple string match
-    return today in date_str or today.replace("-", "/") in date_str
+    if not dt:
+        # Fallback: check today AND yesterday
+        today = ph_today_str()
+        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        if today in date_str or today.replace("-","/") in date_str:
+            return True
+        if yesterday in date_str or yesterday.replace("-","/") in date_str:
+            return True
+        return False
+    
+    event_dt = dt.replace(tzinfo=None)
+    return twenty_four_hours_ago <= event_dt <= now
 
 # ─────────── LOAD/SAVE SENT IDs ───────────
 def load_sent_ids(filename):
@@ -99,8 +108,6 @@ def cors_protect(response):
     if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Methods"] = "GET"
-    else:
-        response.headers["Access-Control-Allow-Origin"] = ""
     return response
 
 # ─────────── TELEGRAM ───────────
@@ -146,14 +153,15 @@ def is_in_philippines(lat, lon):
 
 def scrape_earthquakes():
     now = ph_now().strftime('%Y-%m-%d %H:%M:%S')
-    today = ph_today_str()
-    print(f"\n[{now}] 🕒 PH Time — Checking Earthquake page... (TODAY: {today})")
+    print(f"\n[{now}] 🕒 PH Time — Checking Earthquake page... (LAST 24 HOURS)")
     try:
         resp = requests.get(SITES["earthquake"], headers=HEADERS, timeout=30)
         soup = BeautifulSoup(resp.text, "html.parser")
         rows = soup.find_all("tr")
         results = []
-        today_count = 0
+        recent_count = 0
+        old_count = 0
+        
         for row in rows:
             cols = [td.get_text(strip=True) for td in row.find_all("td")]
             if len(cols) < 6: continue
@@ -161,26 +169,30 @@ def scrape_earthquakes():
                 mag = float(cols[4])
                 lat, lon = float(cols[1]), float(cols[2])
             except: continue
+            
             if mag >= MIN_MAG and is_in_philippines(lat, lon):
                 item_id = f"{cols[0]}|{mag}|{lat}|{lon}"
-                is_today = is_today_in_ph(cols[0])
-                if is_today:
-                    today_count += 1
-                results.append({
-                    "id": item_id,
-                    "datetime": cols[0],
-                    "latitude": lat,
-                    "longitude": lon,
-                    "depth_km": cols[3],
-                    "magnitude": mag,
-                    "location": cols[5],
-                    "is_today": is_today,
-                    "last_updated": now
-                })
+                within_24h = is_within_24_hours(cols[0])
+                
+                if within_24h:
+                    recent_count += 1
+                    results.append({
+                        "id": item_id,
+                        "datetime": cols[0],
+                        "latitude": lat,
+                        "longitude": lon,
+                        "depth_km": cols[3],
+                        "magnitude": mag,
+                        "location": cols[5],
+                        "is_within_24h": True,
+                        "last_updated": now
+                    })
+                else:
+                    old_count += 1
+                    print(f"🗑️ Skipped OLD: {cols[0]} | M{mag} | {cols[5]}")
         
-        # Sort: newest first (reverse order since PHIVOLCS shows oldest first)
         results.reverse()
-        print(f"✅ Found {len(results)} total — {today_count} from TODAY only")
+        print(f"✅ Result: {recent_count} events (last 24hrs) kept | {old_count} older removed")
         return results
     except Exception as e:
         print(f"❌ Earthquake Scrape Error: {e}")
@@ -223,12 +235,22 @@ def scrape_tsunami():
 
 # ─────────── SAVE JSON ───────────
 def save_json(data, filename):
-    # Filter: TODAY'S earthquakes only
+    print(f"📅 Filtering — keeping events from the last 24 hours only")
+    
     if filename == "earthquakes.json":
-        data = [d for d in data if d.get("is_today", True)]
-    export = [{k: v for k, v in item.items() if k not in ["id", "is_today"]} for item in data]
+        filtered = []
+        for d in data:
+            if d.get("is_within_24h", True):
+                filtered.append(d)
+            else:
+                print(f"🗑️ Removed from list: {d.get('datetime', 'unknown')}")
+        data = filtered
+    
+    export = [{k: v for k, v in item.items() if k not in ["id", "is_within_24h"]} for item in data]
     with open(f"{filename}.json", "w", encoding="utf-8") as f:
         json.dump(export, f, ensure_ascii=False, indent=2)
+    
+    print(f"✅ Saved {filename}.json — {len(data)} items in list")
 
 # ─────────── API ROUTES ───────────
 def check_key():
@@ -239,10 +261,10 @@ def home():
     return {
         "status": "online",
         "ph_time": ph_now().strftime('%Y-%m-%d %H:%M:%S'),
-        "today": ph_today_str(),
+        "filter": "Last 24 hours",
         "refresh_interval": f"{CHECK_INTERVAL} seconds",
         "allowed_website": "https://steveweb.vercel.app",
-        "note": "TODAY'S events only — no old news"
+        "note": "Shows events from the most recent 24 hours — always up to date"
     }
 
 @app.route('/earthquakes.json')
@@ -257,16 +279,16 @@ def get_ts():
 def monitor():
     global last_earthquakes, last_tsunami
     print("\n" + "="*65)
-    print("  🇵🇭 PHIVOLCS MONITOR — FIXED: NO OLD NEWS")
+    print("  🇵🇭 PHIVOLCS MONITOR — 24-HOUR MODE")
     print(f"  🕒 PH Time: {ph_now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  ⏱️ Refresh: Every {CHECK_INTERVAL}sec | M{MIN_MAG}.0+ | TODAY ONLY ONLY")
-    print("  ✅ Remembers sent alerts — NEVER re-send old news")
+    print(f"  ⏱️ Refresh: Every {CHECK_INTERVAL}sec | M{MIN_MAG}.0+ | Last 24 Hours")
+    print("  ✅ Remembers sent alerts — NEVER re-send the same alert twice")
+    print("  ✅ Auto updates daily — always shows latest 24 hours")
     print("="*65 + "\n")
     print(f"📱 Telegram: {'✅ ENABLED' if SEND_TELEGRAM_ALERTS else '❌ DISABLED'}")
     print(f"🔒 Allowed Website: https://steveweb.vercel.app")
     print(f"💾 Loaded {len(last_earthquakes)} sent IDs — will NOT re-alert\n")
 
-    # FIRST RUN: Mark ALL existing items as already sent — NO ALERTS ON STARTUP!
     print("🔵 Initial load — marking existing events as already sent...")
     eq_list = scrape_earthquakes()
     for eq in eq_list:
@@ -282,26 +304,22 @@ def monitor():
     save_json(ts_list, "tsunami")
     print(f"✅ {len(ts_list)} existing tsunami marked — will NOT send alerts for these")
 
-    print("\n🚀 Monitoring ACTIVE — ONLY NEW events from NOW ON will trigger alerts!\n")
+    print("\n🚀 Monitoring ACTIVE — ONLY NEW events will trigger alerts!\n")
 
     while True:
         try:
-            # EARTHQUAKES — TODAY'S ONLY + ONLY NEW ones trigger alert
             eq_list = scrape_earthquakes()
             new_eq_count = 0
             for eq in eq_list:
                 if eq["id"] not in last_earthquakes:
-                    # ✅ ONLY alert if it's TODAY'S event
-                    if eq.get("is_today", False):
-                        print(f"🆕 NEW TODAY'S EARTHQUAKE: M{eq['magnitude']} — {eq['location']} at {eq['datetime']}")
-                        send_telegram_message(format_earthquake_alert(eq))
-                        new_eq_count += 1
+                    print(f"🆕 NEW EARTHQUAKE: M{eq['magnitude']} — {eq['location']} at {eq['datetime']}")
+                    send_telegram_message(format_earthquake_alert(eq))
+                    new_eq_count += 1
                     last_earthquakes.add(eq["id"])
             if new_eq_count > 0:
                 save_sent_ids(SENT_EQ_FILE, last_earthquakes)
             save_json(eq_list, "earthquakes")
 
-            # TSUNAMI
             ts_list = scrape_tsunami()
             new_ts_count = 0
             for ts in ts_list:
