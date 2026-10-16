@@ -184,10 +184,10 @@ def scrape_earthquakes():
                     })
                 else:
                     old_count += 1
-                    print(f"🗑️ SKIPPED (too old): {cols[0]} | M{mag} — NOT sent to Telegram")
+                    print(f"🗑️ HIDDEN (too old): {cols[0]} | M{mag} — NOT shown")
         
         results.reverse()
-        print(f"✅ Result: {recent_count} events (last 24hrs) | {old_count} older skipped")
+        print(f"✅ Earthquakes: {recent_count} shown (last 24h) | {old_count} old hidden")
         return results
     except Exception as e:
         print(f"❌ Earthquake Scrape Error: {e}")
@@ -195,34 +195,49 @@ def scrape_earthquakes():
 
 def scrape_tsunami():
     now = ph_now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{now}] 🕒 PH Time — Checking Tsunami page...")
+    print(f"\n[{now}] 🕒 PH Time — Checking Tsunami page... (LAST 24 HOURS ONLY)")
     try:
         resp = requests.get(SITES["tsunami"], headers=HEADERS, timeout=30)
         if "NO TSUNAMI THREAT" in resp.text.upper():
-            print("✅ No Tsunami Threat")
+            print("✅ No Tsunami Threat — Page says: No threat")
             return []
         soup = BeautifulSoup(resp.text, "html.parser")
         rows = soup.find_all("tr")
         results = []
+        recent_count = 0
+        old_count = 0
+        
         for row in rows:
             cols = [td.get_text(strip=True) for td in row.find_all("td")]
             if len(cols) < 5: continue
             if "NO TSUNAMI THREAT" in " ".join(cols).upper(): continue
-            item_id = f"{cols[0]}|{cols[4]}|{cols[5] if len(cols)>5 else ''}"
-            results.append({
-                "id": item_id,
-                "datetime": cols[0],
-                "latitude": cols[1],
-                "longitude": cols[2],
-                "depth_km": cols[3],
-                "magnitude": cols[4],
-                "location": cols[5] if len(cols)>5 else "",
-                "advisory": cols[6] if len(cols)>6 else "Tsunami Advisory",
-                "last_updated": now
-            })
+            
+            within_24h = is_within_24_hours(cols[0])
+            
+            if within_24h:
+                recent_count += 1
+                item_id = f"{cols[0]}|{cols[4]}|{cols[5] if len(cols)>5 else ''}"
+                results.append({
+                    "id": item_id,
+                    "datetime": cols[0],
+                    "latitude": cols[1],
+                    "longitude": cols[2],
+                    "depth_km": cols[3],
+                    "magnitude": cols[4],
+                    "location": cols[5] if len(cols)>5 else "",
+                    "advisory": cols[6] if len(cols)>6 else "Tsunami Advisory",
+                    "is_within_24h": True,
+                    "last_updated": now
+                })
+            else:
+                old_count += 1
+                print(f"🗑️ HIDDEN (too old): {cols[0]} — NOT shown")
+        
         if results:
             results.reverse()
-            print(f"⚠️ Found {len(results)} tsunami advisory(ies)")
+            print(f"⚠️ Tsunami: {recent_count} shown (last 24h) | {old_count} old hidden")
+        else:
+            print(f"✅ Tsunami: No active threats | {old_count} old entries hidden")
         return results
     except Exception as e:
         print(f"❌ Tsunami Scrape Error: {e}")
@@ -230,22 +245,22 @@ def scrape_tsunami():
 
 # ─────────── SAVE JSON ───────────
 def save_json(data, filename):
-    print(f"📅 Filtering — keeping events from the last 24 hours only")
+    print(f"📅 Saving {filename} — filtering last 24 hours only")
     
-    if filename == "earthquakes.json":
-        filtered = []
-        for d in data:
-            if d.get("is_within_24h", True):
-                filtered.append(d)
-            else:
-                print(f"🗑️ Removed from list: {d.get('datetime', 'unknown')}")
-        data = filtered
+    filtered = []
+    for d in data:
+        if d.get("is_within_24h", True):
+            filtered.append(d)
+        else:
+            print(f"🗑️ Removed: {d.get('datetime', 'unknown')}")
+    data = filtered
     
     export = [{k: v for k, v in item.items() if k not in ["id", "is_within_24h"]} for item in data]
-    with open(f"{filename}.json", "w", encoding="utf-8") as f:
+    filename_only = filename.replace(".json", "")
+    with open(f"{filename_only}.json", "w", encoding="utf-8") as f:
         json.dump(export, f, ensure_ascii=False, indent=2)
     
-    print(f"✅ Saved {filename}.json — {len(data)} items in list")
+    print(f"✅ Saved {filename_only}.json — {len(data)} items visible\n")
 
 # ─────────── API ROUTES ───────────
 def check_key():
@@ -256,10 +271,9 @@ def home():
     return {
         "status": "online",
         "ph_time": ph_now().strftime('%Y-%m-%d %H:%M:%S'),
-        "filter": "Last 24 hours only — no old alerts",
+        "filter": "Last 24 hours only — old entries hidden",
         "refresh_interval": f"{CHECK_INTERVAL} seconds",
-        "allowed_website": "https://steveweb.vercel.app",
-        "note": "Old earthquakes (>24hrs) are NEVER sent to Telegram — only NEW events trigger alerts"
+        "allowed_website": "https://steveweb.vercel.app"
     }
 
 @app.route('/earthquakes.json')
@@ -274,65 +288,65 @@ def get_ts():
 def monitor():
     global last_earthquakes, last_tsunami
     print("\n" + "="*65)
-    print("  🇵🇭 PHIVOLCS MONITOR — FINAL VERSION")
+    print("  🇵🇭 PHIVOLCS MONITOR — TSUNAMI 24H FILTER ADDED")
     print(f"  🕒 PH Time: {ph_now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  ⏱️ Refresh: Every {CHECK_INTERVAL}sec | M{MIN_MAG}.0+ | Last 24 Hours")
-    print("  ✅ Old events NEVER sent — only NEW events trigger alerts")
-    print("  ✅ Sent IDs saved — duplicates blocked even after restart")
+    print(f"  ✅ Earthquakes: Last 24 hours only")
+    print(f"  ✅ Tsunami: Last 24 hours only — OLD HIDDEN")
     print("="*65 + "\n")
-    print(f"📱 Telegram: {'✅ ENABLED' if SEND_TELEGRAM_ALERTS else '❌ DISABLED'}")
-    print(f"🔒 Allowed Website: https://steveweb.vercel.app")
-    print(f"💾 Loaded {len(last_earthquakes)} sent IDs — will NOT re-alert\n")
+    print(f"📱 Telegram: {'✅ ENABLED' if SEND_TELEGRAM_ALERTS else '❌ DISABLED'}\n")
 
-    # MARK EXISTING EVENTS AS SENT — NO ALERTS ON STARTUP
-    print("🔵 STEP 1: Marking ALL existing events as ALREADY SENT — NO ALERTS ON STARTUP")
+    # MARK EXISTING AS SENT — NO ALERTS ON STARTUP
+    print("🔵 Initial load — marking existing events as already sent...")
     eq_list = scrape_earthquakes()
     for eq in eq_list:
         last_earthquakes.add(eq["id"])
     save_sent_ids(SENT_EQ_FILE, last_earthquakes)
     save_json(eq_list, "earthquakes")
-    print(f"✅ {len(eq_list)} existing earthquakes — MARKED AS SENT • NO TELEGRAM ALERT")
+    print(f"✅ Earthquakes: {len(eq_list)} loaded — NO ALERTS SENT\n")
 
     ts_list = scrape_tsunami()
     for ts in ts_list:
         last_tsunami.add(ts["id"])
     save_sent_ids(SENT_TS_FILE, last_tsunami)
     save_json(ts_list, "tsunami")
-    print(f"✅ {len(ts_list)} existing tsunami — MARKED AS SENT • NO TELEGRAM ALERT")
+    print(f"✅ Tsunami: {len(ts_list)} loaded — NO ALERTS SENT\n")
 
-    print("\n🚀 MONITORING STARTED — ONLY NEW EVENTS FROM NOW ON WILL SEND ALERTS!\n")
+    print("🚀 MONITORING STARTED — ONLY NEW + WITHIN 24H = ALERT!\n")
 
     while True:
         try:
-            # EARTHQUAKES — NEW + WITHIN 24H = ALERT
+            # EARTHQUAKES
             eq_list = scrape_earthquakes()
             new_eq_count = 0
             for eq in eq_list:
                 if eq["id"] not in last_earthquakes:
                     if eq.get("is_within_24h", False):
-                        print(f"🆕 NEW ALERT SENT: M{eq['magnitude']} — {eq['location']} at {eq['datetime']}")
+                        print(f"🆕 NEW EQ ALERT: M{eq['magnitude']} — {eq['location']}")
                         send_telegram_message(format_earthquake_alert(eq))
                         new_eq_count += 1
                     else:
-                        print(f"⏳ TOO OLD — NOT SENT: {eq['datetime']} | M{eq['magnitude']}")
+                        print(f"⏳ OLD EQ — skipped: {eq['datetime']}")
                     last_earthquakes.add(eq["id"])
             if new_eq_count > 0:
                 save_sent_ids(SENT_EQ_FILE, last_earthquakes)
-                print(f"✅ {new_eq_count} NEW earthquake alert(s) sent")
+                print(f"✅ {new_eq_count} EQ alert(s) sent")
             save_json(eq_list, "earthquakes")
 
-            # TSUNAMI
+            # TSUNAMI — WITH 24H FILTER
             ts_list = scrape_tsunami()
             new_ts_count = 0
             for ts in ts_list:
                 if ts["id"] not in last_tsunami:
-                    print(f"🆕 NEW TSUNAMI ALERT SENT: M{ts['magnitude']} — {ts['datetime']}")
-                    send_telegram_message(format_tsunami_alert(ts))
+                    if ts.get("is_within_24h", False):
+                        print(f"🆕 NEW TSUNAMI ALERT: M{ts['magnitude']} — {ts['datetime']}")
+                        send_telegram_message(format_tsunami_alert(ts))
+                        new_ts_count += 1
+                    else:
+                        print(f"⏳ OLD TSUNAMI — skipped: {ts['datetime']}")
                     last_tsunami.add(ts["id"])
-                    new_ts_count += 1
             if new_ts_count > 0:
                 save_sent_ids(SENT_TS_FILE, last_tsunami)
-                print(f"✅ {new_ts_count} NEW tsunami alert(s) sent")
+                print(f"✅ {new_ts_count} Tsunami alert(s) sent")
             save_json(ts_list, "tsunami")
 
             time.sleep(CHECK_INTERVAL)
