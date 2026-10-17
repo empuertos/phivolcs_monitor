@@ -1,423 +1,476 @@
+"""
+PHIVOLCS Real-Time Monitor (v2)
+- Shows ONLY today's (PH time) earthquakes & tsunami advisories
+- 30s polling for near real-time updates
+- Auto-resets sent-ID cache at midnight (PH)
+- Atomic JSON writes, Telegram HTML escaping, robust date parsing
+"""
+
+import os
+import json
+import time
+import html
+from datetime import datetime, timedelta
+from threading import Thread, Lock
+
 import requests
 from bs4 import BeautifulSoup
-import time
-import json
-import os
-from datetime import datetime, timedelta
-from flask import Flask, send_file, request
-from threading import Thread
+from flask import Flask, send_file, request, jsonify
 
 # ============= CONFIGURATION =============
 SITES = {
-    "tsunami": "https://tsunami.phivolcs.dost.gov.ph/",
-    "earthquake": "https://earthquake.phivolcs.dost.gov.ph/EQLatest.html"
+    "tsunami":    "https://tsunami.phivolcs.dost.gov.ph/",
+    "earthquake": "https://earthquake.phivolcs.dost.gov.ph/EQLatest.html",
 }
 
 HEADERS = {
-    "User-Agent": "PH-Earthquake-Monitor/1.0 (your-email@example.com)"
+    "User-Agent": "PH-Earthquake-Monitor/2.0 (+https://steveweb.vercel.app)"
 }
 
 PH_LAT_MIN, PH_LAT_MAX = 4.0, 22.0
 PH_LON_MIN, PH_LON_MAX = 116.0, 127.0
 MIN_MAGNITUDE = 4.0
-CHECK_INTERVAL_SECONDS = 60
+
+# ← tighter polling = closer to real-time
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 ENABLE_TELEGRAM_ALERTS = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 ACCESS_KEY = os.getenv("ACCESS_KEY", "CHANGE-ME-TO-YOUR-SECRET-KEY")
 
 ALLOWED_ORIGINS = [
     "https://steveweb.vercel.app",
     "http://localhost:3000",
-    "http://127.0.0.1:5500"
+    "http://127.0.0.1:5500",
 ]
-# ========================================
+# =========================================
 
 SENT_EARTHQUAKES_FILE = "sent_earthquakes.json"
-SENT_TSUNAMIS_FILE = "sent_tsunami.json"
-PH_TIMEZONE_OFFSET = 8
+SENT_TSUNAMIS_FILE    = "sent_tsunami.json"
+PH_TIMEZONE_OFFSET    = 8   # UTC+8
 
 app = Flask(__name__)
+http = requests.Session()
+http.headers.update(HEADERS)
 
 # --------------------------
-# TIME UTILITY FUNCTIONS
+# LOGGING
+# --------------------------
+def log(msg):
+    print(msg, flush=True)
+
+# --------------------------
+# TIME UTILITIES
 # --------------------------
 def get_ph_time():
-    """Get current time in Philippines (UTC+8)"""
+    """Current Philippine time (UTC+8), naive datetime."""
     return datetime.utcnow() + timedelta(hours=PH_TIMEZONE_OFFSET)
 
 def get_ph_date_string():
-    """Get today's date as string YYYY-MM-DD"""
     return get_ph_time().strftime("%Y-%m-%d")
 
-def parse_phivolcs_datetime(datetime_string):
-    """Try parsing different datetime formats from PHIVOLCS pages"""
-    datetime_string = datetime_string.strip()
-    formats = [
-        "%Y-%m-%d %H:%M:%S",
-        "%m/%d/%Y %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%m/%d/%Y %H:%M"
-    ]
-    for fmt in formats:
+_DATETIME_FORMATS = [
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%d %B %Y - %I:%M %p",
+    "%d %b %Y - %I:%M %p",
+    "%d %B %Y %I:%M %p",
+    "%d %b %Y %I:%M %p",
+    "%d %B %Y - %H:%M",
+    "%d %b %Y - %H:%M",
+    "%B %d, %Y %I:%M %p",
+    "%b %d, %Y %I:%M %p",
+    "%B %d, %Y - %I:%M %p",
+    "%b %d, %Y - %I:%M %p",
+]
+
+def parse_phivolcs_datetime(s):
+    if not s:
+        return None
+    s = str(s).strip()
+    for fmt in _DATETIME_FORMATS:
         try:
-            return datetime.strptime(datetime_string, fmt)
+            return datetime.strptime(s, fmt)
         except ValueError:
             continue
     return None
 
-def is_within_last_24_hours(datetime_string):
-    """Check if a given datetime falls within the last 24 hours"""
-    now = get_ph_time()
-    twenty_four_hours_ago = now - timedelta(hours=24)
-    
-    parsed_datetime = parse_phivolcs_datetime(datetime_string)
-    if not parsed_datetime:
-        # Fallback: check if date string contains today or yesterday
-        today = get_ph_date_string()
-        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-        if today in datetime_string or today.replace("-", "/") in datetime_string:
-            return True
-        if yesterday in datetime_string or yesterday.replace("-", "/") in datetime_string:
-            return True
+def is_today_ph(datetime_string):
+    """True only if the event happened TODAY in Philippine time."""
+    if not datetime_string:
         return False
-    
-    return twenty_four_hours_ago <= parsed_datetime.replace(tzinfo=None) <= now
+
+    now_ph = get_ph_time()
+    parsed = parse_phivolcs_datetime(datetime_string)
+    if parsed is not None:
+        return parsed.date() == now_ph.date()
+
+    # Fallback string matching (in case PHIVOLCS changes format)
+    s = str(datetime_string)
+    if now_ph.strftime("%Y-%m-%d") in s or now_ph.strftime("%m/%d/%Y") in s:
+        return True
+
+    day_variants = {str(now_ph.day), f"{now_ph.day:02d}"}
+    month_full  = now_ph.strftime("%B")
+    month_short = now_ph.strftime("%b")
+    year        = now_ph.year
+    for d in day_variants:
+        if f"{d} {month_full} {year}" in s or f"{d} {month_short} {year}" in s:
+            return True
+    return False
+
+def sort_newest_first(items):
+    """Sort by parsed datetime, newest first."""
+    def key(it):
+        return parse_phivolcs_datetime(it.get("datetime", "")) or datetime.min
+    return sorted(items, key=key, reverse=True)
 
 # --------------------------
-# SENT TRACKING FUNCTIONS
+# SENT-ID TRACKING (today only)
 # --------------------------
 def load_sent_ids(filename):
-    """Load IDs of already sent alerts from file"""
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except (json.JSONDecodeError, IOError):
-            return set()
-    return set()
+    if not os.path.exists(filename):
+        return set()
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return set(data) if isinstance(data, list) else set()
+    except (json.JSONDecodeError, IOError):
+        return set()
 
-def save_sent_ids(filename, id_set):
-    """Save IDs of sent alerts to file"""
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(list(id_set), f)
+def save_sent_ids(filename, ids):
+    try:
+        tmp = filename + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(ids), f)
+        os.replace(tmp, filename)
+    except IOError as e:
+        log(f"⚠️ Could not save {filename}: {e}")
 
-sent_earthquake_ids = load_sent_ids(SENT_EARTHQUAKES_FILE)
-sent_tsunami_ids = load_sent_ids(SENT_TSUNAMIS_FILE)
+def prune_sent_ids(ids):
+    """Keep only IDs whose embedded datetime is today (PH)."""
+    return {i for i in ids if is_today_ph(i.split("|", 1)[0])}
+
+sent_earthquake_ids = prune_sent_ids(load_sent_ids(SENT_EARTHQUAKES_FILE))
+sent_tsunami_ids    = prune_sent_ids(load_sent_ids(SENT_TSUNAMIS_FILE))
+save_sent_ids(SENT_EARTHQUAKES_FILE, sent_earthquake_ids)
+save_sent_ids(SENT_TSUNAMIS_FILE,    sent_tsunami_ids)
 
 # --------------------------
-# SECURITY HEADERS
+# SECURITY / CORS
 # --------------------------
 @app.after_request
 def add_cors_headers(response):
-    """Allow access only from trusted websites"""
     origin = request.headers.get("Origin", "")
     if origin in ALLOWED_ORIGINS:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Methods"] = "GET"
+        response.headers["Access-Control-Allow-Origin"]  = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Vary"] = "Origin"
+    response.headers["Cache-Control"] = "no-store, max-age=0"
     return response
 
 # --------------------------
-# TELEGRAM ALERT FUNCTIONS
+# TELEGRAM
 # --------------------------
+def _esc(v):
+    return html.escape(str(v), quote=False)
+
 def send_telegram_message(message_text):
-    """Send a message to Telegram chat"""
     if not ENABLE_TELEGRAM_ALERTS:
         return False
     try:
-        api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        response = requests.post(api_url, json={
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        r = http.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message_text,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
         }, timeout=15)
-        return response.json().get("ok", False)
-    except requests.exceptions.RequestException as error:
-        print(f"⚠️ Telegram Error: {error}")
+        ok = r.json().get("ok", False)
+        if not ok:
+            log(f"⚠️ Telegram rejected: {r.text}")
+        return ok
+    except requests.exceptions.RequestException as e:
+        log(f"⚠️ Telegram Error: {e}")
         return False
 
-def format_earthquake_alert_message(earthquake):
-    """Format earthquake data into readable Telegram message"""
-    return f"""🌍 *NEW EARTHQUAKE ALERT*
-📍 Location: {earthquake['location']}
-🕒 Time: {earthquake['datetime']} (PH)
-📊 Magnitude: {earthquake['magnitude']}
-🌐 Coordinates: {earthquake['latitude']}°N, {earthquake['longitude']}°E
-🔻 Depth: {earthquake['depth_km']} km
-Source: PHIVOLCS-DOST"""
+def format_earthquake_alert_message(eq):
+    return (
+        "🌍 <b>NEW EARTHQUAKE ALERT</b>\n"
+        f"📍 Location: {_esc(eq['location'])}\n"
+        f"🕒 Time: {_esc(eq['datetime'])} (PH)\n"
+        f"📊 Magnitude: <b>{_esc(eq['magnitude'])}</b>\n"
+        f"🌐 Coordinates: {_esc(eq['latitude'])}°N, {_esc(eq['longitude'])}°E\n"
+        f"🔻 Depth: {_esc(eq['depth_km'])} km\n"
+        "Source: PHIVOLCS-DOST"
+    )
 
-def format_tsunami_alert_message(tsunami):
-    """Format tsunami data into readable Telegram message"""
-    return f"""🌊 *NEW TSUNAMI ADVISORY*
-⚠️ Tsunami threat detected!
-🕒 Issued: {tsunami['datetime']} (PH)
-📍 Location: {tsunami.get('location', 'Philippines')}
-📊 Magnitude: {tsunami['magnitude']}
-Advisory: {tsunami.get('advisory', 'Tsunami Information')}
-Source: PHIVOLCS-DOST"""
+def format_tsunami_alert_message(ts):
+    return (
+        "🌊 <b>NEW TSUNAMI ADVISORY</b>\n"
+        "⚠️ Tsunami threat detected!\n"
+        f"🕒 Issued: {_esc(ts['datetime'])} (PH)\n"
+        f"📍 Location: {_esc(ts.get('location') or 'Philippines')}\n"
+        f"📊 Magnitude: {_esc(ts['magnitude'])}\n"
+        f"Advisory: {_esc(ts.get('advisory') or 'Tsunami Information')}\n"
+        "Source: PHIVOLCS-DOST"
+    )
 
 # --------------------------
-# DATA SCRAPERS
+# SCRAPERS
 # --------------------------
-def is_within_philippines(latitude, longitude):
-    """Check if coordinates are within Philippine territory"""
+def is_within_philippines(lat, lon):
     try:
-        return PH_LAT_MIN <= float(latitude) <= PH_LAT_MAX and PH_LON_MIN <= float(longitude) <= PH_LON_MAX
+        return PH_LAT_MIN <= float(lat) <= PH_LAT_MAX and PH_LON_MIN <= float(lon) <= PH_LON_MAX
     except (ValueError, TypeError):
         return False
 
 def scrape_earthquake_data():
-    """Fetch and parse latest earthquake data from PHIVOLCS"""
-    current_time = get_ph_time().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"\n[{current_time}] 🕒 Checking Earthquake page... (Last 24 hours only)")
+    now_str = get_ph_time().strftime("%Y-%m-%d %H:%M:%S")
+    log(f"\n[{now_str}] 🕒 Earthquake scrape (today only)")
     try:
-        response = requests.get(SITES["earthquake"], headers=HEADERS, timeout=30)
-        soup = BeautifulSoup(response.text, "html.parser")
-        table_rows = soup.find_all("tr")
-        
-        results = []
-        visible_count = 0
-        hidden_count = 0
-        
-        for row in table_rows:
-            columns = [cell.get_text(strip=True) for cell in row.find_all("td")]
-            if len(columns) < 6:
+        r = http.get(SITES["earthquake"], timeout=30)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        results, hidden = [], 0
+        for row in soup.find_all("tr"):
+            cols = [c.get_text(strip=True) for c in row.find_all("td")]
+            if len(cols) < 6:
                 continue
-            
             try:
-                magnitude = float(columns[4])
-                latitude = float(columns[1])
-                longitude = float(columns[2])
+                mag = float(cols[4])
+                lat = float(cols[1])
+                lon = float(cols[2])
             except (ValueError, IndexError):
                 continue
-            
-            if magnitude >= MIN_MAGNITUDE and is_within_philippines(latitude, longitude):
-                unique_id = f"{columns[0]}|{magnitude}|{latitude}|{longitude}"
-                recent_enough = is_within_last_24_hours(columns[0])
-                
-                if recent_enough:
-                    visible_count += 1
-                    results.append({
-                        "id": unique_id,
-                        "datetime": columns[0],
-                        "latitude": latitude,
-                        "longitude": longitude,
-                        "depth_km": columns[3],
-                        "magnitude": magnitude,
-                        "location": columns[5],
-                        "is_within_24h": True,
-                        "last_updated": current_time
-                    })
-                else:
-                    hidden_count += 1
-                    print(f"🗑️ Hidden (too old): {columns[0]} | M{magnitude}")
-        
-        results.reverse()
-        print(f"✅ Earthquakes: {visible_count} shown | {hidden_count} old entries hidden")
+
+            if mag < MIN_MAGNITUDE or not is_within_philippines(lat, lon):
+                continue
+
+            if is_today_ph(cols[0]):
+                results.append({
+                    "id": f"{cols[0]}|{mag}|{lat}|{lon}",
+                    "datetime": cols[0],
+                    "latitude": lat,
+                    "longitude": lon,
+                    "depth_km": cols[3],
+                    "magnitude": mag,
+                    "location": cols[5],
+                    "is_today": True,
+                    "last_updated": now_str,
+                })
+            else:
+                hidden += 1
+
+        results = sort_newest_first(results)
+        log(f"✅ Earthquakes today: {len(results)} shown | {hidden} old hidden")
         return results
-    except requests.exceptions.RequestException as error:
-        print(f"❌ Earthquake Scrape Error: {error}")
+    except requests.exceptions.RequestException as e:
+        log(f"❌ Earthquake scrape error: {e}")
         return []
 
 def scrape_tsunami_data():
-    """Fetch and parse latest tsunami advisories from PHIVOLCS"""
-    current_time = get_ph_time().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"\n[{current_time}] 🕒 Checking Tsunami page... (Last 24 hours only)")
+    now_str = get_ph_time().strftime("%Y-%m-%d %H:%M:%S")
+    log(f"\n[{now_str}] 🕒 Tsunami scrape (today only)")
     try:
-        response = requests.get(SITES["tsunami"], headers=HEADERS, timeout=30)
-        
-        if "NO TSUNAMI THREAT" in response.text.upper():
-            print("✅ No Tsunami Threat — Page reports no active threat")
+        r = http.get(SITES["tsunami"], timeout=30)
+        if "NO TSUNAMI THREAT" in r.text.upper():
+            log("✅ No tsunami threat reported.")
             return []
-        
-        soup = BeautifulSoup(response.text, "html.parser")
-        table_rows = soup.find_all("tr")
-        
-        results = []
-        visible_count = 0
-        hidden_count = 0
-        
-        for row in table_rows:
-            columns = [cell.get_text(strip=True) for cell in row.find_all("td")]
-            if len(columns) < 5:
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        results, hidden = [], 0
+
+        for row in soup.find_all("tr"):
+            cols = [c.get_text(strip=True) for c in row.find_all("td")]
+            if len(cols) < 5:
                 continue
-            if "NO TSUNAMI THREAT" in " ".join(columns).upper():
+            if "NO TSUNAMI THREAT" in " ".join(cols).upper():
                 continue
-            
-            recent_enough = is_within_last_24_hours(columns[0])
-            
-            if recent_enough:
-                visible_count += 1
-                unique_id = f"{columns[0]}|{columns[4]}|{columns[5] if len(columns) > 5 else ''}"
+
+            if is_today_ph(cols[0]):
                 results.append({
-                    "id": unique_id,
-                    "datetime": columns[0],
-                    "latitude": columns[1],
-                    "longitude": columns[2],
-                    "depth_km": columns[3],
-                    "magnitude": columns[4],
-                    "location": columns[5] if len(columns) > 5 else "",
-                    "advisory": columns[6] if len(columns) > 6 else "Tsunami Advisory",
-                    "is_within_24h": True,
-                    "last_updated": current_time
+                    "id": f"{cols[0]}|{cols[4]}|{cols[5] if len(cols) > 5 else ''}",
+                    "datetime": cols[0],
+                    "latitude": cols[1],
+                    "longitude": cols[2],
+                    "depth_km": cols[3],
+                    "magnitude": cols[4],
+                    "location": cols[5] if len(cols) > 5 else "",
+                    "advisory": cols[6] if len(cols) > 6 else "Tsunami Advisory",
+                    "is_today": True,
+                    "last_updated": now_str,
                 })
             else:
-                hidden_count += 1
-                print(f"🗑️ Hidden (too old): {columns[0]}")
-        
+                hidden += 1
+
+        results = sort_newest_first(results)
         if results:
-            results.reverse()
-            print(f"⚠️ Tsunami: {visible_count} advisory(ies) shown | {hidden_count} old entries hidden")
+            log(f"⚠️ Tsunami today: {len(results)} shown | {hidden} old hidden")
         else:
-            print(f"✅ Tsunami: No active threats | {hidden_count} old entries hidden")
+            log(f"✅ Tsunami: no today advisories | {hidden} old hidden")
         return results
-    except requests.exceptions.RequestException as error:
-        print(f"❌ Tsunami Scrape Error: {error}")
+    except requests.exceptions.RequestException as e:
+        log(f"❌ Tsunami scrape error: {e}")
         return []
 
 # --------------------------
-# SAVE JSON FILES
+# JSON OUTPUT (atomic, today only)
 # --------------------------
 def save_data_to_json(data, filename):
-    """Filter and save data to JSON file"""
-    print(f"📅 Saving {filename} — filtering for last 24 hours only")
-    
-    filtered_data = [item for item in data if item.get("is_within_24h", True)]
-    
-    export_data = []
-    for item in filtered_data:
-        export_item = {key: value for key, value in item.items() if key not in ["id", "is_within_24h"]}
-        export_data.append(export_item)
-    
-    clean_filename = filename.replace(".json", "")
-    with open(f"{clean_filename}.json", "w", encoding="utf-8") as output_file:
-        json.dump(export_data, output_file, ensure_ascii=False, indent=2)
-    
-    print(f"✅ Saved {clean_filename}.json — {len(filtered_data)} items visible\n")
+    items = [d for d in data if d.get("is_today", True)]
+    export = [
+        {k: v for k, v in it.items() if k not in ("id", "is_today")}
+        for it in items
+    ]
+    tmp = filename + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(export, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, filename)
+        log(f"💾 {filename} → {len(export)} today item(s)")
+    except IOError as e:
+        log(f"⚠️ Failed to write {filename}: {e}")
 
 # --------------------------
 # API ENDPOINTS
 # --------------------------
-def verify_access_key(request):
-    """Check if request has valid access key"""
-    return request.args.get("key", "") == ACCESS_KEY
+def verify_access_key(req):
+    return req.args.get("key", "") == ACCESS_KEY
 
-@app.route('/')
+def _send_json(filename):
+    if not os.path.exists(filename):
+        return jsonify([])
+    resp = send_file(filename, mimetype="application/json")
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+@app.route("/")
 def status_page():
     return {
         "status": "online",
-        "ph_time": get_ph_time().strftime('%Y-%m-%d %H:%M:%S'),
-        "data_filter": "Last 24 hours only — old entries automatically hidden",
-        "refresh_interval": f"{CHECK_INTERVAL_SECONDS} seconds",
-        "allowed_website": "https://steveweb.vercel.app"
+        "ph_time": get_ph_time().strftime("%Y-%m-%d %H:%M:%S"),
+        "filter": "TODAY only (PH time) — auto-resets at midnight",
+        "refresh_interval_seconds": CHECK_INTERVAL_SECONDS,
+        "allowed_website": "https://steveweb.vercel.app",
     }
 
-@app.route('/earthquakes.json')
+@app.route("/earthquakes.json")
 def get_earthquakes_json():
-    if verify_access_key(request):
-        return send_file('earthquakes.json', mimetype='application/json')
-    return "❌ Access Denied — Invalid key", 403
+    if not verify_access_key(request):
+        return "❌ Access Denied — Invalid key", 403
+    return _send_json("earthquakes.json")
 
-@app.route('/tsunami.json')
+@app.route("/tsunami.json")
 def get_tsunami_json():
-    if verify_access_key(request):
-        return send_file('tsunami.json', mimetype='application/json')
-    return "❌ Access Denied — Invalid key", 403
+    if not verify_access_key(request):
+        return "❌ Access Denied — Invalid key", 403
+    return _send_json("tsunami.json")
 
 # --------------------------
 # MAIN MONITOR LOOP
 # --------------------------
 def start_monitoring():
     global sent_earthquake_ids, sent_tsunami_ids
-    
-    print("\n" + "="*65)
-    print("  🇵🇭 PHIVOLCS MONITOR — RUNNING")
-    print(f"  🕒 Philippine Time: {get_ph_time().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  ✅ Earthquakes: M{MIN_MAGNITUDE}+ within PH — last 24 hours only")
-    print(f"  ✅ Tsunami: Active advisories — last 24 hours only")
-    print(f"  ✅ Old entries automatically hidden from website & Telegram")
-    print("="*65 + "\n")
-    print(f"📱 Telegram Alerts: {'✅ ENABLED' if ENABLE_TELEGRAM_ALERTS else '❌ DISABLED'}\n")
-    
-    # Mark existing events as already sent — NO ALERTS ON STARTUP
-    print("🔵 Step 1: Loading current data — marking existing events as already sent...")
-    
-    initial_earthquakes = scrape_earthquake_data()
-    for eq in initial_earthquakes:
+
+    log("\n" + "=" * 65)
+    log("  🇵🇭 PHIVOLCS MONITOR v2 — RUNNING")
+    log(f"  🕒 PH time: {get_ph_time().strftime('%Y-%m-%d %H:%M:%S')}")
+    log(f"  ✅ Filter: TODAY only (auto-resets at midnight PH)")
+    log(f"  ✅ Poll interval: {CHECK_INTERVAL_SECONDS}s")
+    log(f"  📱 Telegram: {'ENABLED' if ENABLE_TELEGRAM_ALERTS else 'DISABLED'}")
+    log("=" * 65 + "\n")
+
+    # Mark today's existing events as already-sent (no spam on startup)
+    log("🔵 Startup: seeding sent-IDs with today's events (NO alerts)...")
+    for eq in scrape_earthquake_data():
         sent_earthquake_ids.add(eq["id"])
     save_sent_ids(SENT_EARTHQUAKES_FILE, sent_earthquake_ids)
-    save_data_to_json(initial_earthquakes, "earthquakes.json")
-    print(f"✅ Earthquakes: {len(initial_earthquakes)} loaded — NO TELEGRAM ALERTS SENT\n")
-    
-    initial_tsunamis = scrape_tsunami_data()
-    for ts in initial_tsunamis:
+    save_data_to_json(scrape_earthquake_data(), "earthquakes.json")
+
+    for ts in scrape_tsunami_data():
         sent_tsunami_ids.add(ts["id"])
     save_sent_ids(SENT_TSUNAMIS_FILE, sent_tsunami_ids)
-    save_data_to_json(initial_tsunamis, "tsunami.json")
-    print(f"✅ Tsunami: {len(initial_tsunamis)} loaded — NO TELEGRAM ALERTS SENT\n")
-    
-    print("🚀 MONITORING STARTED — ONLY NEW EVENTS WILL TRIGGER ALERTS!\n")
-    
-    # Main loop
+    save_data_to_json(scrape_tsunami_data(), "tsunami.json")
+
+    log("🚀 Monitoring started — only NEW events will trigger alerts.\n")
+    last_day = get_ph_date_string()
+
     while True:
         try:
-            # Check for new earthquakes
-            current_earthquakes = scrape_earthquake_data()
-            new_earthquake_count = 0
-            
-            for quake in current_earthquakes:
-                if quake["id"] not in sent_earthquake_ids:
-                    if quake.get("is_within_24h", False):
-                        print(f"🆕 NEW EARTHQUAKE: M{quake['magnitude']} — {quake['location']}")
-                        send_telegram_message(format_earthquake_alert_message(quake))
-                        new_earthquake_count += 1
-                    else:
-                        print(f"⏳ Skipped (too old): {quake['datetime']}")
-                    sent_earthquake_ids.add(quake["id"])
-            
-            if new_earthquake_count > 0:
+            # ---- Midnight reset ----
+            current_day = get_ph_date_string()
+            if current_day != last_day:
+                log(f"\n📅 New PH day ({current_day}) — resetting sent-ID cache.\n")
+                sent_earthquake_ids.clear()
+                sent_tsunami_ids.clear()
                 save_sent_ids(SENT_EARTHQUAKES_FILE, sent_earthquake_ids)
-                print(f"✅ {new_earthquake_count} new earthquake alert(s) sent")
-            
-            save_data_to_json(current_earthquakes, "earthquakes.json")
-            
-            # Check for new tsunami advisories
-            current_tsunamis = scrape_tsunami_data()
-            new_tsunami_count = 0
-            
-            for advisory in current_tsunamis:
-                if advisory["id"] not in sent_tsunami_ids:
-                    if advisory.get("is_within_24h", False):
-                        print(f"🆕 NEW TSUNAMI ADVISORY: M{advisory['magnitude']} — {advisory['datetime']}")
-                        send_telegram_message(format_tsunami_alert_message(advisory))
-                        new_tsunami_count += 1
-                    else:
-                        print(f"⏳ Skipped (too old): {advisory['datetime']}")
-                    sent_tsunami_ids.add(advisory["id"])
-            
-            if new_tsunami_count > 0:
+                save_sent_ids(SENT_TSUNAMIS_FILE,    sent_tsunami_ids)
+                last_day = current_day
+
+            # ---- Earthquakes ----
+            quakes = scrape_earthquake_data()
+            new_eq = 0
+            for q in quakes:
+                if q["id"] in sent_earthquake_ids:
+                    continue
+                if q.get("is_today"):
+                    log(f"🆕 NEW EARTHQUAKE: M{q['magnitude']} — {q['location']}")
+                    send_telegram_message(format_earthquake_alert_message(q))
+                    new_eq += 1
+                sent_earthquake_ids.add(q["id"])
+            if new_eq:
+                save_sent_ids(SENT_EARTHQUAKES_FILE, sent_earthquake_ids)
+                log(f"✅ {new_eq} new earthquake alert(s) sent.")
+            save_data_to_json(quakes, "earthquakes.json")
+
+            # ---- Tsunami ----
+            tsunamis = scrape_tsunami_data()
+            new_ts = 0
+            for t in tsunamis:
+                if t["id"] in sent_tsunami_ids:
+                    continue
+                if t.get("is_today"):
+                    log(f"🆕 NEW TSUNAMI: M{t['magnitude']} — {t['datetime']}")
+                    send_telegram_message(format_tsunami_alert_message(t))
+                    new_ts += 1
+                sent_tsunami_ids.add(t["id"])
+            if new_ts:
                 save_sent_ids(SENT_TSUNAMIS_FILE, sent_tsunami_ids)
-                print(f"✅ {new_tsunami_count} new tsunami alert(s) sent")
-            
-            save_data_to_json(current_tsunamis, "tsunami.json")
-            
-            # Wait before next check
+                log(f"✅ {new_ts} new tsunami alert(s) sent.")
+            save_data_to_json(tsunamis, "tsunami.json")
+
             time.sleep(CHECK_INTERVAL_SECONDS)
-            
-        except Exception as error:
-            print(f"⚠️ Loop Error: {error} — Retrying in 10 seconds...")
+
+        except Exception as e:
+            log(f"⚠️ Loop error: {e} — retry in 10s")
             time.sleep(10)
 
+# --------------------------
+# BOOTSTRAP (works with python + gunicorn)
+# --------------------------
+_monitor_lock = Lock()
+_monitor_started = False
+
+def ensure_monitor_started():
+    global _monitor_started
+    with _monitor_lock:
+        if _monitor_started:
+            return
+        _monitor_started = True
+    Thread(target=start_monitoring, daemon=True).start()
+
+# Start monitor as soon as this module is imported.
+# On Render/gunicorn use: gunicorn -w 1 phivolcs_monitor:app
+ensure_monitor_started()
+
 if __name__ == "__main__":
-    # Start Flask web server in background thread
-    def run_web_server():
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
-    
-    from threading import Thread
-    web_server_thread = Thread(target=run_web_server, daemon=True)
-    web_server_thread.start()
-    
-    # Start monitoring
-    start_monitoring()
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+        use_reloader=False,   # prevents duplicate monitor thread
+    )
