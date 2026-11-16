@@ -1,4 +1,4 @@
-# fly.toml app configuration file generated for phivolcs-monitor on 2026-11-15T22:44:21Z
+# fly.toml app configuration file generated for phivolcs-monitor on 2026-11-16T23:49:28Z
 #
 # See https://docs.fly.io/reference/configuration for information about how to use this file.
 #
@@ -7,10 +7,11 @@ app = 'phivolcs-monitor'
 primary_region = 'ams'
 
 [build]
+
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = true
   auto_start_machines = true
   min_machines_running = 0
   processes = ['app']
@@ -20,3 +21,11 @@ primary_region = 'ams'
   cpu_kind = 'shared'
   cpus = 1
   memory_mb = 256
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 512
+  processes = ['app']
+  size = 'shared-cpu-1x'
